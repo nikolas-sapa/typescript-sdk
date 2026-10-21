@@ -68,6 +68,12 @@ export class StdioServerTransport implements Transport {
         }
     };
     _onerror = (error: Error) => {
+        if (this._closed) {
+            // Swallow stdin errors that surface after close. The transport is
+            // already closed, but with no listener attached, a late 'error'
+            // event would crash the process with an uncaught exception.
+            return;
+        }
         this.onerror?.(error);
     };
     _onstdouterror = (error: Error) => {
@@ -109,10 +115,13 @@ export class StdioServerTransport implements Transport {
 
         this._started = true;
         // Remove swallow-only 'error' listeners left behind by previously closed
-        // transports on this stream (see close()). Our own listener covers the
-        // stream from here on, so the stale ones are no longer needed — without
-        // this sweep, repeated create→close cycles on the process-global
-        // process.stdout would accumulate listeners.
+        // transports on these streams (see close()). Our own listeners cover the
+        // streams from here on, so the stale ones are no longer needed.
+        for (const listener of this._stdin.listeners('error')) {
+            if ((listener as { [swallowsErrorsAfterClose]?: boolean })[swallowsErrorsAfterClose]) {
+                this._stdin.off('error', listener as (error: Error) => void);
+            }
+        }
         for (const listener of this._stdout.listeners('error')) {
             if ((listener as { [swallowsErrorsAfterClose]?: boolean })[swallowsErrorsAfterClose]) {
                 this._stdout.off('error', listener as (error: Error) => void);
@@ -159,15 +168,14 @@ export class StdioServerTransport implements Transport {
 
         // Remove our event listeners first
         this._stdin.off('data', this._ondata);
-        this._stdin.off('error', this._onerror);
         this._stdin.off('end', this._onstdinclose);
         this._stdin.off('close', this._onstdinclose);
-        // Deliberately keep _onstdouterror attached (it is a no-op now that _closed
-        // is set): a write that was accepted before close may still be pending at
-        // the OS level and can fail after close (e.g. EPIPE when the client hangs
-        // up), and an 'error' event on a listener-less stream would crash the
-        // process. Tag it so the next transport to start on this stream can sweep
-        // it away instead of letting closed transports' listeners accumulate.
+        // Deliberately keep _onerror and _onstdouterror attached (they are no-ops now that _closed
+        // is set): a write or read accepted before close may still fail at the OS level,
+        // and an 'error' event on a listener-less stream would crash the process. Tag them so
+        // the next transport to start on these streams can sweep them away instead of letting
+        // closed transports' listeners accumulate.
+        (this._onerror as { [swallowsErrorsAfterClose]?: boolean })[swallowsErrorsAfterClose] = true;
         (this._onstdouterror as { [swallowsErrorsAfterClose]?: boolean })[swallowsErrorsAfterClose] = true;
 
         // Check if we were the only data listener

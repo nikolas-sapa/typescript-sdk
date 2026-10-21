@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
 import type { JSONRPCMessage } from '@modelcontextprotocol/core-internal';
+import { SdkError, SdkErrorCode } from '@modelcontextprotocol/core-internal';
 
 import type { StdioServerParameters } from '../../src/client/stdio';
 import { DEFAULT_INHERITED_ENV_VARS, StdioClientTransport } from '../../src/client/stdio';
@@ -180,4 +181,72 @@ test('DEFAULT_INHERITED_ENV_VARS matches the host platform', () => {
     } else {
         expect(DEFAULT_INHERITED_ENV_VARS).toEqual(['HOME', 'LOGNAME', 'PATH', 'SHELL', 'TERM', 'USER']);
     }
+});
+
+test('should forward stderr stream errors to onerror without crashing', async () => {
+    const client = new StdioClientTransport({
+        command: 'node',
+        args: ['-e', 'process.stdin.resume(); process.stdin.on("end", () => process.exit(0));'],
+        stderr: 'pipe'
+    });
+
+    const errorPromise = new Promise<Error>(resolve => {
+        client.onerror = resolve;
+    });
+
+    await client.start();
+    const proc = (client as unknown as { _process: import('node:child_process').ChildProcess })._process;
+    const testError = new Error('simulated stderr error');
+    proc.stderr?.emit('error', testError);
+
+    const receivedError = await errorPromise;
+    expect(receivedError).toBe(testError);
+    await client.close();
+});
+
+test('send() rejects with NotConnected if process has not started or has exited', async () => {
+    const client = new StdioClientTransport(serverParameters);
+
+    // Before start
+    await expect(client.send({ jsonrpc: '2.0', id: 1, method: 'ping' })).rejects.toThrow(
+        expect.objectContaining({
+            code: SdkErrorCode.NotConnected
+        })
+    );
+
+    await client.start();
+    await client.close();
+
+    // After close
+    await expect(client.send({ jsonrpc: '2.0', id: 2, method: 'ping' })).rejects.toThrow(
+        expect.objectContaining({
+            code: SdkErrorCode.NotConnected
+        })
+    );
+});
+
+test('send() rejects with ConnectionClosed if process closes during backpressure drain', async () => {
+    const client = new StdioClientTransport({
+        command: 'node',
+        args: ['-e', 'process.stdin.resume();']
+    });
+
+    await client.start();
+    const proc = (client as unknown as { _process: import('node:child_process').ChildProcess })._process;
+
+    const stdin = proc.stdin!;
+    stdin.write = (() => false) as unknown as typeof stdin.write;
+
+    const sendPromise = client.send({ jsonrpc: '2.0', id: 1, method: 'ping' });
+
+    // Kill the child process so it exits and closes
+    proc.kill('SIGKILL');
+
+    await expect(sendPromise).rejects.toThrow(
+        expect.objectContaining({
+            code: SdkErrorCode.ConnectionClosed
+        })
+    );
+
+    await client.close();
 });

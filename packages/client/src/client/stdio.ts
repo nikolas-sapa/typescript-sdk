@@ -177,6 +177,16 @@ export class StdioClientTransport implements Transport {
                 this.onerror?.(error);
             });
 
+            this._process.stderr?.on('error', error => {
+                this.onerror?.(error);
+            });
+
+            if (this._stderrStream) {
+                this._stderrStream.on('error', error => {
+                    this.onerror?.(error);
+                });
+            }
+
             if (this._stderrStream && this._process.stderr) {
                 this._process.stderr.pipe(this._stderrStream);
             }
@@ -319,16 +329,58 @@ export class StdioClientTransport implements Transport {
     }
 
     send(message: JSONRPCMessage): Promise<void> {
-        return new Promise(resolve => {
-            if (!this._process?.stdin) {
-                throw new SdkError(SdkErrorCode.NotConnected, 'Not connected');
+        return new Promise((resolve, reject) => {
+            if (!this._process?.stdin || typeof this._process.exitCode === 'number') {
+                reject(new SdkError(SdkErrorCode.NotConnected, 'Not connected'));
+                return;
             }
 
+            const proc = this._process;
+            const stdin = proc.stdin!;
             const json = serializeMessage(message);
-            if (this._process.stdin.write(json)) {
+
+            let settled = false;
+            const onError = (error: Error) => {
+                if (settled) return;
+                settled = true;
+                stdin.off?.('error', onError);
+                stdin.off?.('drain', onDrain);
+                stdin.off?.('close', onClose);
+                proc.off?.('close', onClose);
+                reject(error);
+            };
+            const onDrain = () => {
+                if (settled) return;
+                settled = true;
+                stdin.off?.('error', onError);
+                stdin.off?.('drain', onDrain);
+                stdin.off?.('close', onClose);
+                proc.off?.('close', onClose);
                 resolve();
-            } else {
-                this._process.stdin.once('drain', resolve);
+            };
+            const onClose = () => {
+                if (settled) return;
+                settled = true;
+                stdin.off?.('error', onError);
+                stdin.off?.('drain', onDrain);
+                stdin.off?.('close', onClose);
+                proc.off?.('close', onClose);
+                reject(new SdkError(SdkErrorCode.ConnectionClosed, 'Connection closed'));
+            };
+
+            stdin.once?.('error', onError);
+            stdin.once?.('close', onClose);
+            proc.once?.('close', onClose);
+
+            if (stdin.write(json)) {
+                if (settled) return;
+                settled = true;
+                stdin.off?.('error', onError);
+                stdin.off?.('close', onClose);
+                proc.off?.('close', onClose);
+                resolve();
+            } else if (!settled) {
+                stdin.once?.('drain', onDrain);
             }
         });
     }

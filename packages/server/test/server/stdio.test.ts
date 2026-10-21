@@ -442,6 +442,41 @@ test('should respect custom maxBufferSize option', async () => {
     expect(closeCount).toBe(1);
 });
 
+test('should swallow stdin error after close without firing onerror or throwing', async () => {
+    const server = new StdioServerTransport(input, output);
+    let onerrorFired = false;
+    server.onerror = () => {
+        onerrorFired = true;
+    };
+
+    await server.start();
+    await server.close();
+
+    // Emitting error on stdin after close should be swallowed safely
+    expect(() => {
+        input.emit('error', new Error('Late stdin error'));
+    }).not.toThrow();
+
+    expect(onerrorFired).toBe(false);
+});
+
+test('should clean up stale swallow-after-close listeners on stdin when new transport starts', async () => {
+    const server1 = new StdioServerTransport(input, output);
+    await server1.start();
+    await server1.close();
+
+    // After close, error listener is kept with swallow tag
+    expect(input.listenerCount('error')).toBe(1);
+
+    const server2 = new StdioServerTransport(input, output);
+    await server2.start();
+
+    // Starting new transport sweeps away stale swallow listener, leaving only new active listener
+    expect(input.listenerCount('error')).toBe(1);
+
+    await server2.close();
+});
+
 test('should fire onerror and close when ReadBuffer overflows', async () => {
     const server = new StdioServerTransport(input, output);
 
@@ -465,4 +500,39 @@ test('should fire onerror and close when ReadBuffer overflows', async () => {
 
     expect(receivedError?.message).toMatch(/ReadBuffer exceeded maximum size/);
     expect(closeCount).toBe(1);
+});
+
+test('should swallow stdin error after close without firing onerror or throwing', async () => {
+    const server = new StdioServerTransport(input, output);
+    let onerrorFired = false;
+    server.onerror = () => {
+        onerrorFired = true;
+    };
+
+    await server.start();
+    await server.close();
+
+    // Emitting error on stdin after close should be swallowed safely
+    expect(() => {
+        input.emit('error', new Error('Late stdin error'));
+    }).not.toThrow();
+
+    expect(onerrorFired).toBe(false);
+});
+
+test('should clean up stale swallow-after-close listeners on stdin when new transport starts', async () => {
+    const server1 = new StdioServerTransport(input, output);
+    await server1.start();
+    await server1.close();
+
+    // After close, error listener is kept with swallow tag
+    expect(input.listenerCount('error')).toBe(1);
+
+    const server2 = new StdioServerTransport(input, output);
+    await server2.start();
+
+    // Starting new transport sweeps away stale swallow listener, leaving only new active listener
+    expect(input.listenerCount('error')).toBe(1);
+
+    await server2.close();
 });
