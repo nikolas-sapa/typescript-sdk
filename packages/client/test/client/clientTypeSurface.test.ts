@@ -9,6 +9,7 @@
 import type { CallToolResult, EmptyResult, ListToolsResult, ReadResourceResult } from '@modelcontextprotocol/core-internal';
 import { describe, expectTypeOf, test } from 'vitest';
 
+import type { UnauthorizedContext } from '../../src/index';
 import { Client } from '../../src/client/client';
 
 type KnownKeyOf<T> = keyof { [K in keyof T as string extends K ? never : number extends K ? never : K]: T[K] };
@@ -26,5 +27,9 @@ describe('client method return types', () => {
         expectTypeOf<Awaited<ReturnType<Client['listTools']>>>().toEqualTypeOf<ListToolsResult>();
         expectTypeOf<Awaited<ReturnType<Client['readResource']>>>().toEqualTypeOf<ReadResourceResult>();
         expectTypeOf<Extract<KnownKeyOf<Awaited<ReturnType<Client['listTools']>>>, 'resultType'>>().toEqualTypeOf<never>();
+    });
+
+    test('exports UnauthorizedContext from public barrel', () => {
+        expectTypeOf<UnauthorizedContext>().toBeObject();
     });
 });

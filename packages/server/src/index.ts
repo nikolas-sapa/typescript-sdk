@@ -23,6 +23,8 @@ export type {
     AnyToolHandler,
     BaseToolCallback,
     CompleteResourceTemplateCallback,
+    LegacyPromptCallback,
+    LegacyToolCallback,
     ListResourcesCallback,
     McpServerOptions,
     PromptCallback,
@@ -98,7 +100,8 @@ export { classifyInboundRequest } from '@modelcontextprotocol/core-internal';
 
 // Cache hints for cacheable 2026-07-28 results (ServerOptions.cacheHints and
 // the registerResource cacheHint option).
-export type { CacheHint, CacheScope } from '@modelcontextprotocol/core-internal';
+export type { CacheableResultMethod, CacheHint, CacheScope } from '@modelcontextprotocol/core-internal';
+export { isCacheableResultMethod } from '@modelcontextprotocol/core-internal';
 
 // Multi round-trip requests (protocol revision 2026-07-28): the authoring
 // helpers a handler uses to request additional client input by returning an
