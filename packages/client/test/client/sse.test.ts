@@ -1969,5 +1969,22 @@ describe('SSEClientTransport', () => {
             expect(onerror).toHaveBeenCalledTimes(1);
             expect(onerror.mock.calls[0]![0].message).toBe('refresh failed');
         });
+
+        it('preserves Last-Event-ID and headers from eventSourceInit on SSE connection', async () => {
+            transport = new SSEClientTransport(resourceBaseUrl, {
+                eventSourceInit: {
+                    headers: {
+                        'Last-Event-ID': 'stream-event-42',
+                        'X-Event-Source-Header': 'custom-val'
+                    }
+                }
+            });
+
+            await transport.start();
+            expect(lastServerRequest.headers['last-event-id']).toBe('stream-event-42');
+            expect(lastServerRequest.headers['x-event-source-header']).toBe('custom-val');
+            expect(lastServerRequest.headers['accept']).toBe('text/event-stream');
+            await transport.close();
+        });
     });
 });
