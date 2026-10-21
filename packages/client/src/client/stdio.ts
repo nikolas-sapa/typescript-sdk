@@ -55,17 +55,23 @@ export const DEFAULT_INHERITED_ENV_VARS =
     process.platform === 'win32'
         ? [
               'APPDATA',
+              'COMSPEC',
               'HOMEDRIVE',
               'HOMEPATH',
               'LOCALAPPDATA',
               'PATH',
+              'PATHEXT',
               'PROCESSOR_ARCHITECTURE',
+              'PROGRAMDATA',
+              'PROGRAMFILES',
+              'PROGRAMFILES(X86)',
+              'PROGRAMW6432',
               'SYSTEMDRIVE',
               'SYSTEMROOT',
               'TEMP',
               'USERNAME',
               'USERPROFILE',
-              'PROGRAMFILES'
+              'WINDIR'
           ]
         : /* list inspired by the default env inheritance of sudo */
           ['HOME', 'LOGNAME', 'PATH', 'SHELL', 'TERM', 'USER'];
@@ -170,6 +176,16 @@ export class StdioClientTransport implements Transport {
             this._process.stdout?.on('error', error => {
                 this.onerror?.(error);
             });
+
+            this._process.stderr?.on('error', error => {
+                this.onerror?.(error);
+            });
+
+            if (this._stderrStream) {
+                this._stderrStream.on('error', error => {
+                    this.onerror?.(error);
+                });
+            }
 
             if (this._stderrStream && this._process.stderr) {
                 this._process.stderr.pipe(this._stderrStream);
@@ -313,16 +329,58 @@ export class StdioClientTransport implements Transport {
     }
 
     send(message: JSONRPCMessage): Promise<void> {
-        return new Promise(resolve => {
-            if (!this._process?.stdin) {
-                throw new SdkError(SdkErrorCode.NotConnected, 'Not connected');
+        return new Promise((resolve, reject) => {
+            if (!this._process?.stdin || typeof this._process.exitCode === 'number') {
+                reject(new SdkError(SdkErrorCode.NotConnected, 'Not connected'));
+                return;
             }
 
+            const proc = this._process;
+            const stdin = proc.stdin!;
             const json = serializeMessage(message);
-            if (this._process.stdin.write(json)) {
+
+            let settled = false;
+            const onError = (error: Error) => {
+                if (settled) return;
+                settled = true;
+                stdin.off?.('error', onError);
+                stdin.off?.('drain', onDrain);
+                stdin.off?.('close', onClose);
+                proc.off?.('close', onClose);
+                reject(error);
+            };
+            const onDrain = () => {
+                if (settled) return;
+                settled = true;
+                stdin.off?.('error', onError);
+                stdin.off?.('drain', onDrain);
+                stdin.off?.('close', onClose);
+                proc.off?.('close', onClose);
                 resolve();
-            } else {
-                this._process.stdin.once('drain', resolve);
+            };
+            const onClose = () => {
+                if (settled) return;
+                settled = true;
+                stdin.off?.('error', onError);
+                stdin.off?.('drain', onDrain);
+                stdin.off?.('close', onClose);
+                proc.off?.('close', onClose);
+                reject(new SdkError(SdkErrorCode.ConnectionClosed, 'Connection closed'));
+            };
+
+            stdin.once?.('error', onError);
+            stdin.once?.('close', onClose);
+            proc.once?.('close', onClose);
+
+            if (stdin.write(json)) {
+                if (settled) return;
+                settled = true;
+                stdin.off?.('error', onError);
+                stdin.off?.('close', onClose);
+                proc.off?.('close', onClose);
+                resolve();
+            } else if (!settled) {
+                stdin.once?.('drain', onDrain);
             }
         });
     }
