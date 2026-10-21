@@ -431,7 +431,7 @@ describe('Zod v4', () => {
         let transport: WebStandardStreamableHTTPServerTransport;
         let mcpServer: McpServer;
 
-        beforeEach(async () => {
+        async function connectStatelessPair(): Promise<void> {
             mcpServer = new McpServer({ name: 'test-server', version: '1.0.0' }, { capabilities: { logging: {} } });
 
             mcpServer.registerTool(
@@ -447,7 +447,9 @@ describe('Zod v4', () => {
             });
 
             await mcpServer.connect(transport);
-        });
+        }
+
+        beforeEach(connectStatelessPair);
 
         afterEach(async () => {
             await transport.close();
@@ -465,12 +467,23 @@ describe('Zod v4', () => {
             // Initialize
             const initRequest = createRequest('POST', TEST_MESSAGES.initialize);
             await transport.handleRequest(initRequest);
+            await transport.close();
 
-            // Subsequent request without session ID should work
+            // Subsequent request without session ID should work on its own transport
+            await connectStatelessPair();
             const request = createRequest('POST', TEST_MESSAGES.toolsList);
             const response = await transport.handleRequest(request);
 
             expect(response.status).toBe(200);
+        });
+
+        it('should reject a second request on the same transport', async () => {
+            const first = await transport.handleRequest(createRequest('POST', TEST_MESSAGES.initialize));
+            expect(first.status).toBe(200);
+
+            await expect(transport.handleRequest(createRequest('POST', TEST_MESSAGES.toolsList))).rejects.toThrow(
+                'Stateless transport cannot be reused across requests. Create a new transport per request.'
+            );
         });
     });
 
@@ -1595,12 +1608,13 @@ describe('WebStandardStreamableHTTPServerTransport request body limits', () => {
     });
 
     it('maxRequestBodySize sets the bound on both read paths and is validated at construction', async () => {
-        const strict = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, maxRequestBodySize: 1024 });
-        const declared = await strict.handleRequest(streamedPost(1, { 'Content-Length': '1025' }).request);
+        const strict = (): WebStandardStreamableHTTPServerTransport =>
+            new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, maxRequestBodySize: 1024 });
+        const declared = await strict().handleRequest(streamedPost(1, { 'Content-Length': '1025' }).request);
         expect(declared.status).toBe(413);
         expectErrorResponse(await declared.json(), -32_000, /must not exceed 1024 bytes/);
         const streamed = streamedPost(2);
-        const overLimit = await strict.handleRequest(streamed.request);
+        const overLimit = await strict().handleRequest(streamed.request);
         expect(overLimit.status).toBe(413);
         expect(streamed.pulls()).toBe(1);
 
@@ -1627,12 +1641,168 @@ describe('WebStandardStreamableHTTPServerTransport request body limits', () => {
         const batch = Array.from({ length: 101 }, (_, i): JSONRPCMessage => ({ jsonrpc: '2.0', method: 'ping', id: i }));
         const onmessage = vi.fn();
         transport.onmessage = onmessage;
+        const second = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+        second.onmessage = onmessage;
         const read = await transport.handleRequest(createRequest('POST', batch));
-        const preParsed = await transport.handleRequest(createRequest('POST', batch), { parsedBody: batch });
+        const preParsed = await second.handleRequest(createRequest('POST', batch), { parsedBody: batch });
         for (const response of [read, preParsed]) {
             expect(response.status).toBe(400);
             expectErrorResponse(await response.json(), -32_600, /Batch must not exceed 100 messages/);
         }
         expect(onmessage).not.toHaveBeenCalled();
+    });
+
+    describe('cancellation settlement (issue #3053)', () => {
+        it('in JSON mode, notifications/cancelled immediately settles in-flight POST with 202 and cleans up mappings', async () => {
+            const server = new McpServer({ name: 'test-cancel-server', version: '1.0.0' });
+            let toolFinished = false;
+            server.registerTool('slowTool', { description: 'slow' }, async () => {
+                await new Promise(resolve => setTimeout(resolve, 150));
+                toolFinished = true;
+                return { content: [{ type: 'text', text: 'finished' }] };
+            });
+
+            const cancelTransport = new WebStandardStreamableHTTPServerTransport({
+                sessionIdGenerator: randomUUID,
+                enableJsonResponse: true
+            });
+            await server.connect(cancelTransport);
+
+            const post = (body: unknown, sessionId?: string) =>
+                cancelTransport.handleRequest(
+                    new Request('http://localhost/mcp', {
+                        method: 'POST',
+                        headers: {
+                            accept: 'application/json, text/event-stream',
+                            'content-type': 'application/json',
+                            'mcp-protocol-version': '2025-11-25',
+                            ...(sessionId && { 'mcp-session-id': sessionId })
+                        },
+                        body: JSON.stringify(body)
+                    })
+                );
+
+            const initRes = await post({
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'initialize',
+                params: {
+                    protocolVersion: '2025-11-25',
+                    capabilities: {},
+                    clientInfo: { name: 'test-client', version: '1.0.0' }
+                }
+            });
+            const sessionId = initRes.headers.get('mcp-session-id')!;
+            await post({ jsonrpc: '2.0', method: 'notifications/initialized' }, sessionId);
+
+            // Start slow call (id: 2)
+            const callPromise = post(
+                {
+                    jsonrpc: '2.0',
+                    id: 2,
+                    method: 'tools/call',
+                    params: { name: 'slowTool' }
+                },
+                sessionId
+            );
+
+            // Wait 20ms then send cancellation
+            await new Promise(resolve => setTimeout(resolve, 20));
+            const cancelRes = await post(
+                {
+                    jsonrpc: '2.0',
+                    method: 'notifications/cancelled',
+                    params: { requestId: 2 }
+                },
+                sessionId
+            );
+            expect(cancelRes.status).toBe(202);
+
+            // The in-flight call POST must resolve promptly with 202
+            const callRes = await callPromise;
+            expect(callRes.status).toBe(202);
+
+            // Mappings must be cleanly cleared
+            const internalTransport = cancelTransport as unknown as {
+                _streamMapping: Map<unknown, unknown>;
+                _requestToStreamMapping: Map<unknown, unknown>;
+            };
+            expect(internalTransport._streamMapping.size).toBe(0);
+            expect(internalTransport._requestToStreamMapping.size).toBe(0);
+
+            await cancelTransport.close();
+        });
+
+        it('in SSE mode, notifications/cancelled closes stream and cleans up mappings', async () => {
+            const server = new McpServer({ name: 'test-cancel-sse', version: '1.0.0' });
+            server.registerTool('slowTool', { description: 'slow' }, async () => {
+                await new Promise(resolve => setTimeout(resolve, 150));
+                return { content: [{ type: 'text', text: 'finished' }] };
+            });
+
+            const cancelTransport = new WebStandardStreamableHTTPServerTransport({
+                sessionIdGenerator: randomUUID,
+                enableJsonResponse: false
+            });
+            await server.connect(cancelTransport);
+
+            const post = (body: unknown, sessionId?: string) =>
+                cancelTransport.handleRequest(
+                    new Request('http://localhost/mcp', {
+                        method: 'POST',
+                        headers: {
+                            accept: 'application/json, text/event-stream',
+                            'content-type': 'application/json',
+                            'mcp-protocol-version': '2025-11-25',
+                            ...(sessionId && { 'mcp-session-id': sessionId })
+                        },
+                        body: JSON.stringify(body)
+                    })
+                );
+
+            const initRes = await post({
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'initialize',
+                params: {
+                    protocolVersion: '2025-11-25',
+                    capabilities: {},
+                    clientInfo: { name: 'test-client', version: '1.0.0' }
+                }
+            });
+            const sessionId = initRes.headers.get('mcp-session-id')!;
+            await post({ jsonrpc: '2.0', method: 'notifications/initialized' }, sessionId);
+
+            // Start slow call in SSE mode
+            const sseRes = await post(
+                {
+                    jsonrpc: '2.0',
+                    id: 2,
+                    method: 'tools/call',
+                    params: { name: 'slowTool' }
+                },
+                sessionId
+            );
+            expect(sseRes.status).toBe(200);
+
+            // Cancel the request
+            await post(
+                {
+                    jsonrpc: '2.0',
+                    method: 'notifications/cancelled',
+                    params: { requestId: 2 }
+                },
+                sessionId
+            );
+
+            const internalTransport = cancelTransport as unknown as {
+                _streamMapping: Map<unknown, unknown>;
+                _requestToStreamMapping: Map<unknown, unknown>;
+            };
+            expect(internalTransport._streamMapping.size).toBe(0);
+            expect(internalTransport._requestToStreamMapping.size).toBe(0);
+
+            await cancelTransport.close();
+        });
     });
 });

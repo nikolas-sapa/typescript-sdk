@@ -7,12 +7,21 @@
  * For Node.js Express/HTTP compatibility, use {@linkcode @modelcontextprotocol/node!NodeStreamableHTTPServerTransport | NodeStreamableHTTPServerTransport} which wraps this transport.
  */
 
-import type { AuthInfo, JSONRPCMessage, MessageExtraInfo, RequestId, Transport } from '@modelcontextprotocol/core-internal';
+import type {
+    AuthInfo,
+    JSONRPCMessage,
+    JSONRPCNotification,
+    JSONRPCRequest,
+    MessageExtraInfo,
+    RequestId,
+    Transport
+} from '@modelcontextprotocol/core-internal';
 import {
     DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
     isInitializeRequest,
     isJsonContentType,
     isJSONRPCErrorResponse,
+    isJSONRPCNotification,
     isJSONRPCRequest,
     isJSONRPCResultResponse,
     JSONRPCMessageSchema,
@@ -20,6 +29,8 @@ import {
 } from '@modelcontextprotocol/core-internal';
 
 import { MAX_BATCH_SIZE, readRequestBody, requestBodyTooLargeMessage, resolveMaxRequestBodySize } from './requestBody';
+import type { ScopeChallengeHandler } from './scopeChallenge';
+import { createScopeChallengeResponse, findScopeChallenge, scopeChallengeResourceMetadataUrl } from './scopeChallenge';
 import { armSseKeepAlive, DEFAULT_SSE_KEEP_ALIVE_MS } from './sseKeepAlive';
 
 export type StreamId = string;
@@ -233,6 +244,10 @@ export interface HandleRequestOptions {
  * @example Hono.js
  * ```ts source="./streamableHttp.examples.ts#WebStandardStreamableHTTPServerTransport_hono"
  * app.all('/mcp', async c => {
+ *     // Stateless example: create a server and a transport per request.
+ *     const server = new McpServer({ name: 'my-server', version: '1.0.0' });
+ *     const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+ *     await server.connect(transport);
  *     return transport.handleRequest(c.req.raw);
  * });
  * ```
@@ -241,6 +256,10 @@ export interface HandleRequestOptions {
  * ```ts source="./streamableHttp.examples.ts#WebStandardStreamableHTTPServerTransport_workers"
  * const worker = {
  *     async fetch(request: Request): Promise<Response> {
+ *         // Stateless example: create a server and a transport per request.
+ *         const server = new McpServer({ name: 'my-server', version: '1.0.0' });
+ *         const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+ *         await server.connect(transport);
  *         return transport.handleRequest(request);
  *     }
  * };
@@ -250,6 +269,7 @@ export class WebStandardStreamableHTTPServerTransport implements Transport {
     // when sessionId is not set (undefined), it means the transport is in stateless mode
     private sessionIdGenerator: (() => string) | undefined;
     private _started: boolean = false;
+    private _hasHandledRequest: boolean = false;
     private _closed: boolean = false;
     private _streamMapping: Map<string, StreamMapping> = new Map();
     private _requestToStreamMapping: Map<RequestId, string> = new Map();
@@ -267,6 +287,7 @@ export class WebStandardStreamableHTTPServerTransport implements Transport {
     private _supportedProtocolVersions: string[];
     private _keepAliveMs: number;
     private _maxRequestBodySize: number;
+    private _scopeChallengeResolver?: ScopeChallengeHandler;
 
     sessionId?: string;
     onclose?: () => void;
@@ -302,6 +323,11 @@ export class WebStandardStreamableHTTPServerTransport implements Transport {
             }
         });
         return timer;
+    }
+
+    /** Sets the scope challenge resolver for parsed JSON-RPC requests. */
+    setScopeChallengeResolver(resolver: ScopeChallengeHandler): void {
+        this._scopeChallengeResolver = resolver;
     }
 
     /**
@@ -352,6 +378,19 @@ export class WebStandardStreamableHTTPServerTransport implements Transport {
         );
     }
 
+    private async _checkScopeChallenge(messages: JSONRPCMessage[], authInfo?: AuthInfo): Promise<Response | undefined> {
+        // Active whenever a connected McpServer supplied a resolver (it
+        // resolves per-primitive scopeChallenge callbacks); the challenge's
+        // resource_metadata parameter is derived from the verified AuthInfo
+        // and omitted when unavailable.
+        if (!this._scopeChallengeResolver) {
+            return undefined;
+        }
+        const requests: JSONRPCRequest[] = messages.filter(message => isJSONRPCRequest(message));
+        const challenge = await findScopeChallenge(requests, authInfo, this._scopeChallengeResolver);
+        return challenge === undefined ? undefined : createScopeChallengeResponse(challenge, scopeChallengeResourceMetadataUrl(authInfo));
+    }
+
     /**
      * Validates request headers for DNS rebinding protection.
      * @returns Error response if validation fails, `undefined` if validation passes.
@@ -393,6 +432,12 @@ export class WebStandardStreamableHTTPServerTransport implements Transport {
         if (this._closed) {
             return this.createJsonErrorResponse(404, -32_001, 'Session not found');
         }
+
+        // A stateless transport (no sessionIdGenerator) serves exactly one request.
+        if (!this.sessionIdGenerator && this._hasHandledRequest) {
+            throw new Error('Stateless transport cannot be reused across requests. Create a new transport per request.');
+        }
+        this._hasHandledRequest = true;
 
         // Validate request headers for DNS rebinding protection
         const validationError = this.validateRequestHeaders(req);
@@ -741,6 +786,63 @@ export class WebStandardStreamableHTTPServerTransport implements Transport {
         );
     }
 
+    private _handleCancelledNotification(message: JSONRPCNotification): void {
+        const requestId = (message.params as { requestId?: RequestId } | undefined)?.requestId;
+        if (requestId === undefined) {
+            return;
+        }
+
+        const streamId = this._requestToStreamMapping.get(requestId);
+        if (!streamId) {
+            return;
+        }
+
+        const stream = this._streamMapping.get(streamId);
+        const relatedIds = [...this._requestToStreamMapping.entries()].filter(([_, sid]) => sid === streamId).map(([id]) => id);
+
+        // Remove the cancelled request from tracking
+        this._requestToStreamMapping.delete(requestId);
+        this._requestResponseMap.delete(requestId);
+
+        const remainingRelatedIds = relatedIds.filter(id => id !== requestId);
+
+        if (remainingRelatedIds.length === 0) {
+            // No other requests in this stream
+            if (this._enableJsonResponse && stream?.resolveJson) {
+                const headers: Record<string, string> = {};
+                if (this.sessionId !== undefined) {
+                    headers['mcp-session-id'] = this.sessionId;
+                }
+                stream.resolveJson(new Response(null, { status: 202, headers }));
+            }
+            stream?.cleanup();
+        } else {
+            // Check if all remaining responses are ready
+            const allRemainingReady = remainingRelatedIds.every(id => this._requestResponseMap.has(id));
+            if (allRemainingReady) {
+                if (this._enableJsonResponse && stream?.resolveJson) {
+                    const headers: Record<string, string> = {
+                        'Content-Type': 'application/json'
+                    };
+                    if (this.sessionId !== undefined) {
+                        headers['mcp-session-id'] = this.sessionId;
+                    }
+                    const responses = remainingRelatedIds.map(id => this._requestResponseMap.get(id)!);
+                    if (responses.length === 1) {
+                        stream.resolveJson(Response.json(responses[0], { status: 200, headers }));
+                    } else {
+                        stream.resolveJson(Response.json(responses, { status: 200, headers }));
+                    }
+                }
+                stream?.cleanup();
+                for (const id of remainingRelatedIds) {
+                    this._requestResponseMap.delete(id);
+                    this._requestToStreamMapping.delete(id);
+                }
+            }
+        }
+    }
+
     /**
      * Handles `POST` requests containing JSON-RPC messages
      */
@@ -856,12 +958,27 @@ export class WebStandardStreamableHTTPServerTransport implements Transport {
                 return this.createJsonErrorResponse(404, -32_001, 'Session not found');
             }
 
+            // Check before opening SSE so an insufficient token can receive HTTP 403.
+            let scopeChallengeResponse: Response | undefined;
+            try {
+                scopeChallengeResponse = await this._checkScopeChallenge(messages, options?.authInfo);
+            } catch (error) {
+                this.onerror?.(error as Error);
+                return this.createJsonErrorResponse(500, -32_603, 'Internal server error');
+            }
+            if (scopeChallengeResponse) {
+                return scopeChallengeResponse;
+            }
+
             // check if it contains requests
             const hasRequests = messages.some(element => isJSONRPCRequest(element));
 
             if (!hasRequests) {
                 // if it only contains notifications or responses, return 202
                 for (const message of messages) {
+                    if (isJSONRPCNotification(message) && message.method === 'notifications/cancelled') {
+                        this._handleCancelledNotification(message);
+                    }
                     this.onmessage?.(message, { authInfo: options?.authInfo, request });
                 }
                 return new Response(null, { status: 202 });
@@ -896,6 +1013,9 @@ export class WebStandardStreamableHTTPServerTransport implements Transport {
                     }
 
                     for (const message of messages) {
+                        if (isJSONRPCNotification(message) && message.method === 'notifications/cancelled') {
+                            this._handleCancelledNotification(message);
+                        }
                         this.onmessage?.(message, { authInfo: options?.authInfo, request });
                     }
                 });
@@ -961,6 +1081,10 @@ export class WebStandardStreamableHTTPServerTransport implements Transport {
 
             // handle each message
             for (const message of messages) {
+                if (isJSONRPCNotification(message) && message.method === 'notifications/cancelled') {
+                    this._handleCancelledNotification(message);
+                }
+
                 // Build closeSSEStream callback for requests when eventStore is configured
                 // AND client supports resumability (a supported protocol version >= 2025-11-25).
                 // Old clients can't resume if the stream is closed early because they
