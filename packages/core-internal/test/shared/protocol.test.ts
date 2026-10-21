@@ -1156,6 +1156,56 @@ describe('codec-seam hardening in the protocol funnels', () => {
     });
 });
 
+describe('un-correlated error responses (omitted id)', () => {
+    test('delivers un-correlated error responses to onerror as ProtocolError and does not hijack request 0', async () => {
+        const [peerTx, protocolTx] = InMemoryTransport.createLinkedPair();
+        await peerTx.start();
+
+        const protocol = createTestProtocol();
+        const errors: Error[] = [];
+        protocol.onerror = error => void errors.push(error);
+        await protocol.connect(protocolTx);
+
+        // Send request 0 (first request issued)
+        let resolved = false;
+        const reqPromise = protocol.request({ method: 'ping' }).then(() => {
+            resolved = true;
+        });
+
+        // Deliver an un-correlated error response without id (e.g. server parse error)
+        protocolTx.onmessage?.({
+            jsonrpc: '2.0',
+            error: {
+                code: -32700,
+                message: 'Parse error'
+            }
+        } as JSONRPCMessage);
+
+        await new Promise(resolve => setTimeout(resolve, 10));
+
+        // Request 0 should NOT be hijacked or settled
+        expect(resolved).toBe(false);
+
+        // protocol.onerror should receive the ProtocolError directly
+        expect(errors).toHaveLength(1);
+        expect(errors[0]).toBeInstanceOf(ProtocolError);
+        expect((errors[0] as ProtocolError).code).toBe(-32700);
+        expect((errors[0] as ProtocolError).message).toBe('Parse error');
+
+        // Now deliver legitimate result for request 0
+        protocolTx.onmessage?.({
+            jsonrpc: '2.0',
+            id: 0,
+            result: {}
+        } as JSONRPCMessage);
+
+        await reqPromise;
+        expect(resolved).toBe(true);
+
+        await protocol.close();
+    });
+});
+
 describe('inbound validation precedence: −32601 outranks envelope −32602', () => {
     afterEach(() => {
         vi.restoreAllMocks();
@@ -1248,6 +1298,56 @@ describe('inbound protocol-version mismatch (−32022): the error data lists eve
         expect(error.message).toContain('Unsupported protocol version');
         expect(error.data?.supported).toEqual(supportedProtocolVersions);
         expect(error.data?.requested).toBe('2026-07-28');
+
+        await protocol.close();
+    });
+});
+
+describe('un-correlated error responses (omitted id)', () => {
+    test('delivers un-correlated error responses to onerror as ProtocolError and does not hijack request 0', async () => {
+        const [peerTx, protocolTx] = InMemoryTransport.createLinkedPair();
+        await peerTx.start();
+
+        const protocol = createTestProtocol();
+        const errors: Error[] = [];
+        protocol.onerror = error => void errors.push(error);
+        await protocol.connect(protocolTx);
+
+        // Send request 0 (first request issued)
+        let resolved = false;
+        const reqPromise = protocol.request({ method: 'ping' }).then(() => {
+            resolved = true;
+        });
+
+        // Deliver an un-correlated error response without id (e.g. server parse error)
+        protocolTx.onmessage?.({
+            jsonrpc: '2.0',
+            error: {
+                code: -32700,
+                message: 'Parse error'
+            }
+        } as JSONRPCMessage);
+
+        await new Promise(resolve => setTimeout(resolve, 10));
+
+        // Request 0 should NOT be hijacked or settled
+        expect(resolved).toBe(false);
+
+        // protocol.onerror should receive the ProtocolError directly
+        expect(errors).toHaveLength(1);
+        expect(errors[0]).toBeInstanceOf(ProtocolError);
+        expect((errors[0] as ProtocolError).code).toBe(-32700);
+        expect((errors[0] as ProtocolError).message).toBe('Parse error');
+
+        // Now deliver legitimate result for request 0
+        protocolTx.onmessage?.({
+            jsonrpc: '2.0',
+            id: 0,
+            result: {}
+        } as JSONRPCMessage);
+
+        await reqPromise;
+        expect(resolved).toBe(true);
 
         await protocol.close();
     });

@@ -1177,6 +1177,10 @@ export abstract class Protocol<ContextT extends BaseContext> {
 
     private _onprogress(notification: ProgressNotification): void {
         const { progressToken, ...params } = notification.params;
+        if (progressToken === undefined || progressToken === null) {
+            this._onerror(new Error(`Received a progress notification for an unknown token: ${JSON.stringify(notification)}`));
+            return;
+        }
         const messageId = Number(progressToken);
 
         const handler = this._progressHandlers.get(messageId);
@@ -1211,6 +1215,16 @@ export abstract class Protocol<ContextT extends BaseContext> {
      * else.
      */
     protected _onresponse(response: JSONRPCResponse | JSONRPCErrorResponse): void {
+        if (response.id === null || response.id === undefined) {
+            if (isJSONRPCResultResponse(response)) {
+                this._onerror(new Error(`Received a response for an unknown message ID: ${JSON.stringify(response)}`));
+            } else {
+                const error = ProtocolError.fromError(response.error.code, response.error.message, response.error.data);
+                this._onerror(error);
+            }
+            return;
+        }
+
         const messageId = Number(response.id);
 
         const handler = this._responseHandlers.get(messageId);
