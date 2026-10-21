@@ -7,12 +7,21 @@
  * For Node.js Express/HTTP compatibility, use {@linkcode @modelcontextprotocol/node!NodeStreamableHTTPServerTransport | NodeStreamableHTTPServerTransport} which wraps this transport.
  */
 
-import type { AuthInfo, JSONRPCMessage, JSONRPCRequest, MessageExtraInfo, RequestId, Transport } from '@modelcontextprotocol/core-internal';
+import type {
+    AuthInfo,
+    JSONRPCMessage,
+    JSONRPCNotification,
+    JSONRPCRequest,
+    MessageExtraInfo,
+    RequestId,
+    Transport
+} from '@modelcontextprotocol/core-internal';
 import {
     DEFAULT_NEGOTIATED_PROTOCOL_VERSION,
     isInitializeRequest,
     isJsonContentType,
     isJSONRPCErrorResponse,
+    isJSONRPCNotification,
     isJSONRPCRequest,
     isJSONRPCResultResponse,
     JSONRPCMessageSchema,
@@ -777,6 +786,63 @@ export class WebStandardStreamableHTTPServerTransport implements Transport {
         );
     }
 
+    private _handleCancelledNotification(message: JSONRPCNotification): void {
+        const requestId = (message.params as { requestId?: RequestId } | undefined)?.requestId;
+        if (requestId === undefined) {
+            return;
+        }
+
+        const streamId = this._requestToStreamMapping.get(requestId);
+        if (!streamId) {
+            return;
+        }
+
+        const stream = this._streamMapping.get(streamId);
+        const relatedIds = [...this._requestToStreamMapping.entries()].filter(([_, sid]) => sid === streamId).map(([id]) => id);
+
+        // Remove the cancelled request from tracking
+        this._requestToStreamMapping.delete(requestId);
+        this._requestResponseMap.delete(requestId);
+
+        const remainingRelatedIds = relatedIds.filter(id => id !== requestId);
+
+        if (remainingRelatedIds.length === 0) {
+            // No other requests in this stream
+            if (this._enableJsonResponse && stream?.resolveJson) {
+                const headers: Record<string, string> = {};
+                if (this.sessionId !== undefined) {
+                    headers['mcp-session-id'] = this.sessionId;
+                }
+                stream.resolveJson(new Response(null, { status: 202, headers }));
+            }
+            stream?.cleanup();
+        } else {
+            // Check if all remaining responses are ready
+            const allRemainingReady = remainingRelatedIds.every(id => this._requestResponseMap.has(id));
+            if (allRemainingReady) {
+                if (this._enableJsonResponse && stream?.resolveJson) {
+                    const headers: Record<string, string> = {
+                        'Content-Type': 'application/json'
+                    };
+                    if (this.sessionId !== undefined) {
+                        headers['mcp-session-id'] = this.sessionId;
+                    }
+                    const responses = remainingRelatedIds.map(id => this._requestResponseMap.get(id)!);
+                    if (responses.length === 1) {
+                        stream.resolveJson(Response.json(responses[0], { status: 200, headers }));
+                    } else {
+                        stream.resolveJson(Response.json(responses, { status: 200, headers }));
+                    }
+                }
+                stream?.cleanup();
+                for (const id of remainingRelatedIds) {
+                    this._requestResponseMap.delete(id);
+                    this._requestToStreamMapping.delete(id);
+                }
+            }
+        }
+    }
+
     /**
      * Handles `POST` requests containing JSON-RPC messages
      */
@@ -910,6 +976,9 @@ export class WebStandardStreamableHTTPServerTransport implements Transport {
             if (!hasRequests) {
                 // if it only contains notifications or responses, return 202
                 for (const message of messages) {
+                    if (isJSONRPCNotification(message) && message.method === 'notifications/cancelled') {
+                        this._handleCancelledNotification(message);
+                    }
                     this.onmessage?.(message, { authInfo: options?.authInfo, request });
                 }
                 return new Response(null, { status: 202 });
@@ -944,6 +1013,9 @@ export class WebStandardStreamableHTTPServerTransport implements Transport {
                     }
 
                     for (const message of messages) {
+                        if (isJSONRPCNotification(message) && message.method === 'notifications/cancelled') {
+                            this._handleCancelledNotification(message);
+                        }
                         this.onmessage?.(message, { authInfo: options?.authInfo, request });
                     }
                 });
@@ -1009,6 +1081,10 @@ export class WebStandardStreamableHTTPServerTransport implements Transport {
 
             // handle each message
             for (const message of messages) {
+                if (isJSONRPCNotification(message) && message.method === 'notifications/cancelled') {
+                    this._handleCancelledNotification(message);
+                }
+
                 // Build closeSSEStream callback for requests when eventStore is configured
                 // AND client supports resumability (a supported protocol version >= 2025-11-25).
                 // Old clients can't resume if the stream is closed early because they
