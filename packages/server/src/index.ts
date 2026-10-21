@@ -23,7 +23,10 @@ export type {
     AnyToolHandler,
     BaseToolCallback,
     CompleteResourceTemplateCallback,
+    LegacyPromptCallback,
+    LegacyToolCallback,
     ListResourcesCallback,
+    McpServerOptions,
     PromptCallback,
     ReadResourceCallback,
     ReadResourceTemplateCallback,
@@ -37,7 +40,7 @@ export type {
 export { McpServer, ResourceTemplate } from './server/mcp';
 // Runtime-neutral Bearer authentication for web-standard hosts; the Express
 // middleware in @modelcontextprotocol/express adapts the same core.
-export type { BearerAuthOptions, OAuthTokenVerifier } from './server/middleware/bearerAuth';
+export type { BearerAuthOptions, OAuthTokenVerifier, VerifyBearerTokenOptions } from './server/middleware/bearerAuth';
 export { bearerAuthChallengeResponse, requireBearerAuth, verifyBearerToken } from './server/middleware/bearerAuth';
 export type { HostHeaderValidationResult } from './server/middleware/hostHeaderValidation';
 export { hostHeaderValidationResponse, localhostAllowedHostnames, validateHostHeader } from './server/middleware/hostHeaderValidation';
@@ -65,6 +68,8 @@ export { InMemoryServerEventBus } from './server/serverEventBus';
 // StdioServerTransport and the serveStdio entry are exported from the './stdio' subpath — server stdio
 // has only type-level Node imports (erased at compile time), but matching the client's `./stdio` subpath
 // gives consumers a consistent shape across packages.
+export type { ScopeChallenge, ScopeChallengeHandler } from './server/scopeChallenge';
+export { requireScopes } from './server/scopeChallenge';
 export type {
     EventId,
     EventStore,
@@ -95,7 +100,8 @@ export { classifyInboundRequest } from '@modelcontextprotocol/core-internal';
 
 // Cache hints for cacheable 2026-07-28 results (ServerOptions.cacheHints and
 // the registerResource cacheHint option).
-export type { CacheHint, CacheScope } from '@modelcontextprotocol/core-internal';
+export type { CacheableResultMethod, CacheHint, CacheScope } from '@modelcontextprotocol/core-internal';
+export { isCacheableResultMethod } from '@modelcontextprotocol/core-internal';
 
 // Multi round-trip requests (protocol revision 2026-07-28): the authoring
 // helpers a handler uses to request additional client input by returning an
